@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Livecanvas zone painter</title>
+  <style>
+    :root {
+      --bg: #121418;
+      --panel: #1c2026;
+      --line: #2c323c;
+      --text: #e8eaed;
+      --muted: #9aa3ad;
+      --accent: #7db0d8;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
+    }
+    body {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: 100%;
+    }
+    aside {
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      overflow: auto;
+    }
+    h1 {
+      font-size: 15px;
+      font-weight: 650;
+      margin: 0 0 4px;
+    }
+    p.hint, .status {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .group { display: flex; flex-direction: column; gap: 8px; }
+    .group h2 {
+      margin: 0;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .swatches { display: flex; flex-direction: column; gap: 6px; }
+    .swatch {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      border: 1px solid var(--line);
+      background: #161a20;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 10px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .swatch .chip {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      border: 1px solid rgba(255,255,255,0.25);
+      flex: 0 0 auto;
+    }
+    .swatch kbd {
+      margin-left: auto;
+      color: var(--muted);
+      font: 11px ui-monospace, monospace;
+    }
+    .swatch.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent) inset;
+    }
+    .tools, .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    button, select, label.file {
+      background: #161a20;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font: inherit;
+    }
+    button:hover, label.file:hover { border-color: #4a5562; }
+    button.active { border-color: var(--accent); }
+    label.file input { display: none; }
+    input[type="range"] { width: 100%; }
+    main {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      min-width: 0;
+    }
+    .stage {
+      width: min(100%, calc(100vh - 36px) * 36 / 28);
+      aspect-ratio: 36 / 28;
+      position: relative;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 0 0 1px var(--line);
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: crosshair;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <aside>
+    <div>
+      <h1>36×28 zone painter</h1>
+      <p class="hint">Paint cells, then download <code>categorized-human.csv</code>.</p>
+    </div>
+
+    <div class="group">
+      <h2>Label</h2>
+      <div class="swatches" id="swatches"></div>
+    </div>
+
+    <div class="group">
+      <h2>Tool</h2>
+      <div class="tools">
+        <button id="tool-paint" class="active">Paint</button>
+        <button id="tool-fill">Fill</button>
+        <button id="tool-erase">Erase</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2>View</h2>
+      <label>Overlay <span id="opacity-val">45%</span>
+        <input id="opacity" type="range" min="0" max="90" value="45" />
+      </label>
+      <label><input id="grid-lines" type="checkbox" checked /> Grid lines</label>
+      <label>Image
+        <select id="source">
+          <option value="photo">Painting photo</option>
+          <option value="leds">Discretized LEDs</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="group">
+      <h2>File</h2>
+      <div class="row">
+        <button id="undo">Undo</button>
+        <button id="clear">Clear</button>
+      </div>
+      <div class="row">
+        <label class="file">Load CSV<input id="load" type="file" accept=".csv,text/csv" /></label>
+        <button id="download">Download CSV</button>
+      </div>
+    </div>
+
+    <p class="status" id="status">0 / 1008 labeled</p>
+    <p class="hint">Keys 1–5 pick labels. Drag to paint. Right-click erases.</p>
+  </aside>
+
+  <main>
+    <div class="stage">
+      <canvas id="canvas" width="1080" height="840"></canvas>
+    </div>
+  </main>
+
+  <script>
+    const W = 36;
+    const H = 28;
+    const LABELS = [
+      ["sky", "1", [168, 186, 204]],
+      ["far-clouds", "2", [232, 150, 148]],
+      ["near-clouds", "3", [236, 196, 120]],
+      ["background", "4", [196, 78, 58]],
+      ["foreground", "5", [40, 46, 42]],
+    ];
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const swatches = document.getElementById("swatches");
+    const status = document.getElementById("status");
+    const opacityInput = document.getElementById("opacity");
+    const opacityVal = document.getElementById("opacity-val");
+    const gridLines = document.getElementById("grid-lines");
+    const sourceSelect = document.getElementById("source");
+
+    const images = { photo: new Image(), leds: new Image() };
+    images.photo.src = "../input-exact.jpg";
+    images.leds.src = "../discretized.png";
+
+    let grid = makeGrid("");
+    let current = "sky";
+    let tool = "paint";
+    let painting = false;
+    let undoStack = [];
+    const MAX_UNDO = 40;
+
+    function makeGrid(fill) {
+      return Array.from({ length: H }, () => Array.from({ length: W }, () => fill));
+    }
+
+    function cloneGrid(src) {
+      return src.map((row) => row.slice());
+    }
+
+    function pushUndo() {
+      undoStack.push(cloneGrid(grid));
+      if (undoStack.length > MAX_UNDO) undoStack.shift();
+    }
+
+    LABELS.forEach(([name, key, rgb]) => {
+      const btn = document.createElement("button");
+      btn.className = "swatch" + (name === current ? " active" : "");
+      btn.dataset.label = name;
+      btn.innerHTML = `<span class="chip" style="background:rgb(${rgb.join(",")})"></span>${name}<kbd>${key}</kbd>`;
+      btn.addEventListener("click", () => setLabel(name));
+      swatches.appendChild(btn);
+    });
+
+    function setLabel(name) {
+      current = name;
+      tool = "paint";
+      syncTools();
+    }
+
+    function syncTools() {
+      document.querySelectorAll(".swatch").forEach((el) => {
+        el.classList.toggle("active", el.dataset.label === current && tool !== "erase");
+      });
+      document.getElementById("tool-paint").classList.toggle("active", tool === "paint");
+      document.getElementById("tool-fill").classList.toggle("active", tool === "fill");
+      document.getElementById("tool-erase").classList.toggle("active", tool === "erase");
+    }
+
+    document.getElementById("tool-paint").onclick = () => { tool = "paint"; syncTools(); };
+    document.getElementById("tool-fill").onclick = () => { tool = "fill"; syncTools(); };
+    document.getElementById("tool-erase").onclick = () => { tool = "erase"; syncTools(); };
+    document.getElementById("undo").onclick = undo;
+    document.getElementById("clear").onclick = () => {
+      pushUndo();
+      grid = makeGrid("");
+      draw();
+    };
+    document.getElementById("download").onclick = downloadCsv;
+    document.getElementById("load").addEventListener("change", loadCsv);
+    opacityInput.addEventListener("input", () => {
+      opacityVal.textContent = `${opacityInput.value}%`;
+      draw();
+    });
+    gridLines.addEventListener("change", draw);
+    sourceSelect.addEventListener("change", draw);
+    images.photo.onload = draw;
+    images.leds.onload = draw;
+
+    function cellFromEvent(ev) {
+      const rect = canvas.getBoundingClientRect();
+      const x = ((ev.clientX - rect.left) / rect.width) * W;
+      const y = ((ev.clientY - rect.top) / rect.height) * H;
+      const col = Math.floor(x);
+      const row = Math.floor(y);
+      if (col < 0 || col >= W || row < 0 || row >= H) return null;
+      return [col, row];
+    }
+
+    function paintCell(col, row, label) {
+      if (grid[row][col] === label) return false;
+      grid[row][col] = label;
+      return true;
+    }
+
+    function flood(col, row, label) {
+      const target = grid[row][col];
+      if (target === label) return;
+      const q = [[col, row]];
+      const seen = new Set([`${col},${row}`]);
+      while (q.length) {
+        const [x, y] = q.pop();
+        if (grid[y][x] !== target) continue;
+        grid[y][x] = label;
+        for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+          const key = `${nx},${ny}`;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H || seen.has(key)) continue;
+          seen.add(key);
+          q.push([nx, ny]);
+        }
+      }
+    }
+
+    function apply(ev, isStart) {
+      const cell = cellFromEvent(ev);
+      if (!cell) return;
+      const [col, row] = cell;
+      const erase = tool === "erase" || ev.button === 2;
+      const label = erase ? "" : current;
+      if (tool === "fill" && !erase) {
+        if (isStart) {
+          pushUndo();
+          flood(col, row, current);
+        }
+        return;
+      }
+      if (isStart) pushUndo();
+      paintCell(col, row, label);
+    }
+
+    canvas.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      canvas.setPointerCapture(ev.pointerId);
+      painting = true;
+      apply(ev, true);
+      draw();
+    });
+    canvas.addEventListener("pointermove", (ev) => {
+      if (!painting || tool === "fill") return;
+      apply(ev, false);
+      draw();
+    });
+    window.addEventListener("pointerup", () => { painting = false; });
+    canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
+    window.addEventListener("keydown", (ev) => {
+      if (ev.target.matches("input, textarea")) return;
+      const hit = LABELS.find(([, key]) => key === ev.key);
+      if (hit) { setLabel(hit[0]); return; }
+      if (ev.key === "z" && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); undo(); }
+      if (ev.key === "e") { tool = "erase"; syncTools(); }
+      if (ev.key === "b") { tool = "fill"; syncTools(); }
+      if (ev.key === "p") { tool = "paint"; syncTools(); }
+    });
+
+    function undo() {
+      const prev = undoStack.pop();
+      if (!prev) return;
+      grid = prev;
+      draw();
+    }
+
+    function labeledCount() {
+      let n = 0;
+      for (const row of grid) for (const cell of row) if (cell) n += 1;
+      return n;
+    }
+
+    function toCsv() {
+      return grid.map((row) => row.join(",")).join("\n") + "\n";
+    }
+
+    function downloadCsv() {
+      const blob = new Blob([toCsv()], { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "categorized-human.csv";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    function parseCsv(text) {
+      const rows = text.trim().split(/\r?\n/).filter((line) => line.trim() && !line.trim().startsWith("#"));
+      if (rows.length !== H) throw new Error(`Expected ${H} rows, got ${rows.length}`);
+      const next = makeGrid("");
+      const known = new Set(LABELS.map(([name]) => name));
+      rows.forEach((line, y) => {
+        const cells = line.split(",").map((c) => c.trim());
+        if (cells.length !== W) throw new Error(`Row ${y + 1} has ${cells.length} cells`);
+        cells.forEach((cell, x) => {
+          if (!cell) return;
+          if (!known.has(cell)) throw new Error(`Unknown label "${cell}" at ${x},${y}`);
+          next[y][x] = cell;
+        });
+      });
+      return next;
+    }
+
+    function loadCsv(ev) {
+      const file = ev.target.files[0];
+      if (!file) return;
+      file.text().then((text) => {
+        pushUndo();
+        grid = parseCsv(text);
+        draw();
+      }).catch((err) => {
+        alert(err.message || String(err));
+      }).finally(() => {
+        ev.target.value = "";
+      });
+    }
+
+    function draw() {
+      const cw = canvas.width;
+      const ch = canvas.height;
+      const cellW = cw / W;
+      const cellH = ch / H;
+      ctx.clearRect(0, 0, cw, ch);
+
+      const img = images[sourceSelect.value];
+      if (img && img.complete && img.naturalWidth) {
+        ctx.drawImage(img, 0, 0, cw, ch);
+      }
+
+      const alpha = Number(opacityInput.value) / 100;
+      const colorOf = Object.fromEntries(LABELS.map(([name, , rgb]) => [name, rgb]));
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const label = grid[y][x];
+          if (!label) continue;
+          const [r, g, b] = colorOf[label];
+          ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+          ctx.fillRect(x * cellW, y * cellH, cellW, cellH);
+        }
+      }
+
+      if (gridLines.checked) {
+        ctx.strokeStyle = "rgba(0,0,0,0.45)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let x = 0; x <= W; x++) {
+          ctx.moveTo(x * cellW + 0.5, 0);
+          ctx.lineTo(x * cellW + 0.5, ch);
+        }
+        for (let y = 0; y <= H; y++) {
+          ctx.moveTo(0, y * cellH + 0.5);
+          ctx.lineTo(cw, y * cellH + 0.5);
+        }
+        ctx.stroke();
+      }
+
+      const n = labeledCount();
+      status.textContent = `${n} / ${W * H} labeled`;
+    }
+
+    syncTools();
+    draw();
+  </script>
+</body>
+</html>
