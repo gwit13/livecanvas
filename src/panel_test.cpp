@@ -4,161 +4,278 @@
 // =========================================================================
 // Hardware Configuration
 // =========================================================================
-#define LED_PIN       13          // ESP32 GPIO pin connected to DIN (Data In)
-#define LED_TYPE      WS2812B     // LED chipset
-#define COLOR_ORDER   GRB         // Color order (WS2812B is typically GRB)
-#define MATRIX_WIDTH  32          // Width of matrix in pixels
-#define MATRIX_HEIGHT 8           // Height of matrix in pixels
-#define NUM_LEDS      (MATRIX_WIDTH * MATRIX_HEIGHT) // 256 pixels
+#define LED_PIN          13         // ESP32 GPIO pin connected to DIN of first panel
+#define LED_TYPE         WS2812B    // LED chipset
+#define COLOR_ORDER      GRB        // Color order
+
+#define PANEL_WIDTH      32         // Width of each individual panel
+#define PANEL_HEIGHT     8          // Height of each individual panel
+#define NUM_PANELS       3          // Three panels daisy-chained vertically (Top, Middle, Bottom)
+
+#define MATRIX_WIDTH     PANEL_WIDTH                 // 32 columns (X: 0..31)
+#define MATRIX_HEIGHT    (PANEL_HEIGHT * NUM_PANELS) // 24 rows total (Y: 0..23)
+#define NUM_LEDS         (MATRIX_WIDTH * MATRIX_HEIGHT) // 768 pixels total
 
 // -------------------------------------------------------------------------
 // POWER SAFETY NOTE:
-// 256 LEDs at full white can draw up to 15 Amps!
-// When powered directly from the ESP32's VIN pin via USB, the USB port can
-// only provide ~500mA. We cap the brightness and power below to avoid
-// browning out or resetting the ESP32.
+// 768 LEDs at full white can draw over 45 Amps!
+// When running from ESP32 VIN via USB, the USB port provides ~500mA.
+// FastLED's active power manager strictly caps current to 500mA.
 // -------------------------------------------------------------------------
-#define BRIGHTNESS    20          // Safe brightness (scale 0-255, 20 is ~8%)
-#define MAX_POWER_MA  500         // Maximum current in milliamps (USB safe)
+#define BRIGHTNESS       20         // Safe brightness (scale 0-255, 20 is ~8%)
+#define MAX_POWER_MA     500        // Maximum current in milliamps (USB safe)
 
 // =========================================================================
-// Matrix Wiring / Layout Options
+// Independent Per-Panel Orientation Flags
 // =========================================================================
-// Most 8x32 flexible panels (e.g., BTF-LIGHTING) are wired in a
-// COLUMN-MAJOR SERPENTINE (zigzag) layout:
-//   Column 0: LEDs 0 -> 7 (top to bottom)
-//   Column 1: LEDs 15 <- 8 (bottom to top)
-//   Column 2: LEDs 16 -> 23 (top to bottom) ...
+// Because each daisy-chain link loops to the panel below, the orientation
+// alternates (serpentine daisy-chaining):
 //
-// If your panel is wired horizontally row-by-row, change CURRENT_LAYOUT:
-#define LAYOUT_COL_SERPENTINE 1   // Vertical zigzag (most common 8x32)
-#define LAYOUT_ROW_SERPENTINE 2   // Horizontal zigzag
-#define LAYOUT_PROGRESSIVE    3   // Non-zigzag
+// Panel 1 (Top, LEDs 0..255, Y: 0..7):
+#define PANEL_1_FLIP_X   true
+#define PANEL_1_FLIP_Y   true
 
-#define CURRENT_LAYOUT LAYOUT_COL_SERPENTINE
+// Panel 2 (Middle, LEDs 256..511, Y: 8..15):
+// Rotated 180° so DOUT of Panel 1 meets DIN of Panel 2 on the right edge.
+#define PANEL_2_FLIP_X   false
+#define PANEL_2_FLIP_Y   false
+
+// Panel 3 (Bottom, LEDs 512..767, Y: 16..23):
+// DOUT of Panel 2 is on the left edge, meeting DIN of Panel 3 on the left.
+// Matches the exact orientation of Panel 1.
+#define PANEL_3_FLIP_X   true
+#define PANEL_3_FLIP_Y   true
 
 CRGB leds[NUM_LEDS];
 
 // =========================================================================
-// 2D to 1D Mapping Function: XY(x, y) -> LED index
+// 2D to 1D Mapping: XY(x, y) -> LED index (0..767)
 // =========================================================================
 uint16_t XY(uint8_t x, uint8_t y) {
   if (x >= MATRIX_WIDTH || y >= MATRIX_HEIGHT) {
-    return 0; // Safe boundary check
+    return 0; // Boundary safety check
   }
 
-#if CURRENT_LAYOUT == LAYOUT_COL_SERPENTINE
-  // Column-major zigzag (32 columns of 8 LEDs)
-  if (x & 0x01) {
+  uint8_t panelIndex = y / PANEL_HEIGHT; // 0 = Top, 1 = Middle, 2 = Bottom
+  uint8_t py = y % PANEL_HEIGHT;         // 0..7 within the target panel
+  uint8_t px = x;                        // 0..31 within the target panel
+
+  // Apply specific panel orientation transformations
+  if (panelIndex == 0) {
+    if (PANEL_1_FLIP_X) px = (PANEL_WIDTH - 1) - px;
+    if (PANEL_1_FLIP_Y) py = (PANEL_HEIGHT - 1) - py;
+  } else if (panelIndex == 1) {
+    if (PANEL_2_FLIP_X) px = (PANEL_WIDTH - 1) - px;
+    if (PANEL_2_FLIP_Y) py = (PANEL_HEIGHT - 1) - py;
+  } else if (panelIndex == 2) {
+    if (PANEL_3_FLIP_X) px = (PANEL_WIDTH - 1) - px;
+    if (PANEL_3_FLIP_Y) py = (PANEL_HEIGHT - 1) - py;
+  }
+
+  // Column-Major Serpentine layout within each 8x32 panel
+  uint16_t indexInPanel;
+  if (px & 0x01) {
     // Odd columns run bottom to top
-    return (x * MATRIX_HEIGHT) + (MATRIX_HEIGHT - 1 - y);
+    indexInPanel = (px * PANEL_HEIGHT) + (PANEL_HEIGHT - 1 - py);
   } else {
     // Even columns run top to bottom
-    return (x * MATRIX_HEIGHT) + y;
+    indexInPanel = (px * PANEL_HEIGHT) + py;
   }
 
-#elif CURRENT_LAYOUT == LAYOUT_ROW_SERPENTINE
-  // Row-major zigzag (8 rows of 32 LEDs)
-  if (y & 0x01) {
-    // Odd rows run right to left
-    return (y * MATRIX_WIDTH) + (MATRIX_WIDTH - 1 - x);
-  } else {
-    // Even rows run left to right
-    return (y * MATRIX_WIDTH) + x;
-  }
-
-#else
-  // Progressive / linear (row by row)
-  return (y * MATRIX_WIDTH) + x;
-#endif
+  return (panelIndex * (PANEL_WIDTH * PANEL_HEIGHT)) + indexInPanel;
 }
 
 // Helper to set pixel by 2D coordinate
-void setPixel(uint8_t x, uint8_t y, CRGB color) {
-  if (x < MATRIX_WIDTH && y < MATRIX_HEIGHT) {
-    leds[XY(x, y)] = color;
+void setPixel(int x, int y, CRGB color) {
+  if (x >= 0 && x < MATRIX_WIDTH && y >= 0 && y < MATRIX_HEIGHT) {
+    leds[XY((uint8_t)x, (uint8_t)y)] = color;
   }
 }
 
 // =========================================================================
-// Individual Addressing Tests
+// Graphic Helpers for Orientation Diagnostics
 // =========================================================================
 
-// Test 1: Linear / Index Crawler (0 -> 255)
-// Lights each LED one by one along the data chain with a fading trail.
-void testLinearCrawler() {
-  Serial.println(">>> [Test 1] Linear Index Crawler (0 to 255)...");
-  FastLED.clear();
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-    fadeToBlackBy(leds, NUM_LEDS, 64); // Fade previous LEDs to leave a comet tail
-    leds[i] = CRGB::Cyan;
-    FastLED.show();
-
-    if (i % 32 == 0 || i == NUM_LEDS - 1) {
-      Serial.printf("  LED Index: %d / %d\n", i, NUM_LEDS - 1);
-    }
-    delay(15);
-  }
-  delay(300);
+// Draw Digit '1' (4 wide, 6 high)
+void drawDigit1(int x, int y, CRGB color) {
+  setPixel(x + 1, y + 0, color);
+  setPixel(x + 0, y + 1, color);
+  setPixel(x + 1, y + 1, color);
+  setPixel(x + 1, y + 2, color);
+  setPixel(x + 1, y + 3, color);
+  setPixel(x + 1, y + 4, color);
+  setPixel(x + 0, y + 5, color);
+  setPixel(x + 1, y + 5, color);
+  setPixel(x + 2, y + 5, color);
 }
 
-// Test 2: Four Corners Test (2D Coordinate Addressing)
-// Proves (X, Y) coordinate addressing and helps verify panel orientation.
-void testFourCorners() {
-  Serial.println(">>> [Test 2] Four Corners 2D Test (3 seconds)...");
-  Serial.println("  Top-Left     (0, 0)   = RED");
-  Serial.println("  Top-Right    (31, 0)  = GREEN");
-  Serial.println("  Bottom-Left  (0, 7)   = BLUE");
-  Serial.println("  Bottom-Right (31, 7)  = YELLOW");
+// Draw Digit '2' (5 wide, 6 high)
+void drawDigit2(int x, int y, CRGB color) {
+  setPixel(x + 1, y + 0, color);
+  setPixel(x + 2, y + 0, color);
+  setPixel(x + 3, y + 0, color);
+  setPixel(x + 0, y + 1, color);
+  setPixel(x + 4, y + 1, color);
+  setPixel(x + 3, y + 2, color);
+  setPixel(x + 2, y + 3, color);
+  setPixel(x + 1, y + 4, color);
+  setPixel(x + 0, y + 5, color);
+  setPixel(x + 1, y + 5, color);
+  setPixel(x + 2, y + 5, color);
+  setPixel(x + 3, y + 5, color);
+  setPixel(x + 4, y + 5, color);
+}
+
+// Draw Digit '3' (5 wide, 6 high)
+void drawDigit3(int x, int y, CRGB color) {
+  setPixel(x + 1, y + 0, color);
+  setPixel(x + 2, y + 0, color);
+  setPixel(x + 3, y + 0, color);
+  setPixel(x + 4, y + 0, color);
+  setPixel(x + 4, y + 1, color);
+  setPixel(x + 2, y + 2, color);
+  setPixel(x + 3, y + 2, color);
+  setPixel(x + 4, y + 2, color);
+  setPixel(x + 4, y + 3, color);
+  setPixel(x + 4, y + 4, color);
+  setPixel(x + 1, y + 5, color);
+  setPixel(x + 2, y + 5, color);
+  setPixel(x + 3, y + 5, color);
+  setPixel(x + 4, y + 5, color);
+  setPixel(x + 0, y + 4, color);
+}
+
+// Draw X-axis label and arrow: "X --->"
+void drawXAxisArrow(int x, int y, CRGB color) {
+  // Letter 'X' (3x3)
+  setPixel(x + 0, y + 0, color);
+  setPixel(x + 2, y + 0, color);
+  setPixel(x + 1, y + 1, color);
+  setPixel(x + 0, y + 2, color);
+  setPixel(x + 2, y + 2, color);
+
+  // Arrow shaft
+  for (int xi = x + 5; xi <= x + 14; xi++) {
+    setPixel(xi, y + 1, color);
+  }
+
+  // Arrowhead pointing right
+  setPixel(x + 13, y + 0, color);
+  setPixel(x + 14, y + 1, color);
+  setPixel(x + 13, y + 2, color);
+}
+
+// Draw Y-axis label and arrow: "Y | v" pointing down across all 3 panels
+void drawYAxisArrow(int x, CRGB color) {
+  // Letter 'Y' (3x3) at top-left
+  setPixel(x + 0, 0, color);
+  setPixel(x + 2, 0, color);
+  setPixel(x + 1, 1, color);
+  setPixel(x + 1, 2, color);
+
+  // Vertical arrow shaft running down through rows 4..21 (all 3 panels)
+  for (int yi = 4; yi <= 21; yi++) {
+    setPixel(x + 1, yi, color);
+  }
+
+  // Arrowhead pointing DOWN at row 22 on the bottom panel
+  setPixel(x + 0, 20, color);
+  setPixel(x + 2, 20, color);
+  setPixel(x + 1, 22, color);
+}
+
+// =========================================================================
+// Test Patterns
+// =========================================================================
+
+// Test 1: Alignment & Orientation Map ("1", "2", "3" & Directional Arrows)
+void testOrientationMap() {
+  Serial.println("==================================================");
+  Serial.println(">>> [Test 1] Alignment Map: '1', '2', '3' & Axes (5 sec)");
+  Serial.println("  Top Panel (1):    Digit '1' in CYAN   + Arrow (X --->) in GREEN");
+  Serial.println("  Middle Panel (2): Digit '2' in ORANGE + Arrow (X --->) in GREEN");
+  Serial.println("  Bottom Panel (3): Digit '3' in YELLOW + Arrow (X --->) in GREEN");
+  Serial.println("  Left Edge:        Arrow (Y | v) in MAGENTA pointing DOWN (all 3 panels)");
+  Serial.println("  Seam Lines:       Dotted RED lines at Y=7/8 and Y=15/16");
+  Serial.println("==================================================");
 
   FastLED.clear();
-  setPixel(0, 0, CRGB::Red);
-  setPixel(MATRIX_WIDTH - 1, 0, CRGB::Green);
-  setPixel(0, MATRIX_HEIGHT - 1, CRGB::Blue);
-  setPixel(MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1, CRGB::Yellow);
+
+  // 1. Draw Digit '1' and X-arrow on Top Panel (Y: 0..7)
+  drawDigit1(6, 1, CRGB::Cyan);
+  drawXAxisArrow(14, 2, CRGB::Green);
+
+  // 2. Draw Digit '2' and X-arrow on Middle Panel (Y: 8..15)
+  drawDigit2(6, 9, CRGB(255, 110, 0)); // Warm Amber/Orange
+  drawXAxisArrow(14, 10, CRGB::Green);
+
+  // 3. Draw Digit '3' and X-arrow on Bottom Panel (Y: 16..23)
+  drawDigit3(6, 17, CRGB::Yellow);
+  drawXAxisArrow(14, 18, CRGB::Green);
+
+  // 4. Draw Y-axis arrow pointing DOWN across all 3 panels
+  drawYAxisArrow(1, CRGB::Magenta);
+
+  // 5. Draw panel seam indicators at Y=7 and Y=15
+  for (int xi = 12; xi < MATRIX_WIDTH; xi += 2) {
+    setPixel(xi, 7,  CRGB(50, 0, 0)); // Seam between Panel 1 & 2
+    setPixel(xi, 15, CRGB(50, 0, 0)); // Seam between Panel 2 & 3
+  }
+
   FastLED.show();
-  delay(3000);
+  delay(5000); // 5 seconds display hold
 }
 
-// Test 3: Column Sweep (X = 0 -> 31)
-// Sweeps a vertical line across each column.
-void testColumnSweep() {
-  Serial.println(">>> [Test 3] Column Sweep (X: 0 to 31)...");
-  for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
-    FastLED.clear();
-    for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
-      setPixel(x, y, CRGB::Magenta);
-    }
-    FastLED.show();
-    delay(40);
-  }
-}
-
-// Test 4: Row Sweep (Y = 0 -> 7)
-// Sweeps a horizontal line across each row.
+// Test 2: Downward Row Sweep (Top Y=0 down to Bottom Y=23)
+// Confirms that horizontal bars smoothly cross both seams.
 void testRowSweep() {
-  Serial.println(">>> [Test 4] Row Sweep (Y: 0 to 7)...");
-  for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
-    FastLED.clear();
-    for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
-      setPixel(x, y, CRGB::Orange);
+  Serial.println(">>> [Test 2] Row Sweep (Y: 0 down to 23)...");
+  for (uint8_t repeat = 0; repeat < 2; repeat++) {
+    for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+      FastLED.clear();
+      CRGB color;
+      if (y < PANEL_HEIGHT) {
+        color = CRGB::Cyan;
+      } else if (y < PANEL_HEIGHT * 2) {
+        color = CRGB(255, 110, 0); // Orange
+      } else {
+        color = CRGB::Yellow;
+      }
+
+      for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+        setPixel(x, y, color);
+      }
+      FastLED.show();
+      delay(45);
     }
-    FastLED.show();
-    delay(100);
   }
 }
 
-// Test 5: Bouncing Single Pixel
-// Moves an individually addressed pixel around the 32x8 grid.
+// Test 3: Horizontal Column Sweep (Left X=0 to Right X=31)
+// Confirms that 24-pixel tall vertical bars move left to right across all 3 panels.
+void testColumnSweep() {
+  Serial.println(">>> [Test 3] Column Sweep (X: 0 to 31 across all 3 panels)...");
+  for (uint8_t repeat = 0; repeat < 2; repeat++) {
+    for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
+      FastLED.clear();
+      for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
+        setPixel(x, y, CRGB::Green);
+      }
+      FastLED.show();
+      delay(30);
+    }
+  }
+}
+
+// Test 4: Bouncing Pixel across the Unified 32x24 Grid
 void testBouncingPixel() {
-  Serial.println(">>> [Test 5] Bouncing Pixel across (X, Y)...");
+  Serial.println(">>> [Test 4] Bouncing Pixel across 32x24 boundaries...");
   int x = 0, y = 0;
   int dx = 1, dy = 1;
 
-  for (int step = 0; step < 120; step++) {
-    fadeToBlackBy(leds, NUM_LEDS, 80);
-    setPixel(x, y, CHSV((step * 4) % 255, 255, 255));
+  for (int step = 0; step < 180; step++) {
+    fadeToBlackBy(leds, NUM_LEDS, 65);
+    setPixel(x, y, CHSV((step * 3) % 255, 255, 255));
     FastLED.show();
 
     x += dx;
@@ -167,23 +284,7 @@ void testBouncingPixel() {
     if (x <= 0 || x >= MATRIX_WIDTH - 1)  dx = -dx;
     if (y <= 0 || y >= MATRIX_HEIGHT - 1) dy = -dy;
 
-    delay(30);
-  }
-}
-
-// Test 6: 2D Rainbow Color Wave
-// Verifies all 256 pixels can produce clean RGB hues smoothly.
-void testRainbowWave() {
-  Serial.println(">>> [Test 6] 2D Rainbow Wave...");
-  for (uint16_t frame = 0; frame < 200; frame++) {
-    for (uint8_t x = 0; x < MATRIX_WIDTH; x++) {
-      for (uint8_t y = 0; y < MATRIX_HEIGHT; y++) {
-        uint8_t hue = (frame * 2) + (x * 6) + (y * 10);
-        setPixel(x, y, CHSV(hue, 255, 255));
-      }
-    }
-    FastLED.show();
-    delay(20);
+    delay(25);
   }
 }
 
@@ -192,46 +293,51 @@ void testRainbowWave() {
 // =========================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Allow serial monitor to open
+  delay(1000);
 
   Serial.println();
   Serial.println("==================================================");
-  Serial.println("  ESP32 WS2812B 8x32 Matrix Test (256 Pixels)");
+  Serial.println("  ESP32 WS2812B Triple Panel 32x24 Array (768 LEDs)");
   Serial.println("==================================================");
-  Serial.printf("  Data Pin:     GPIO %d\n", LED_PIN);
-  Serial.printf("  Dimensions:   %d x %d (%d LEDs)\n", MATRIX_WIDTH, MATRIX_HEIGHT, NUM_LEDS);
-  Serial.printf("  Power Limit:  %d mA @ 5V (USB safe)\n", MAX_POWER_MA);
-  Serial.printf("  Brightness:   %d / 255\n", BRIGHTNESS);
+  Serial.printf("  Data Pin:       GPIO %d\n", LED_PIN);
+  Serial.printf("  Dimensions:     %d x %d (%d LEDs total)\n", MATRIX_WIDTH, MATRIX_HEIGHT, NUM_LEDS);
+  Serial.printf("  Panel 1 (Top):    FLIP_X=%d, FLIP_Y=%d\n", PANEL_1_FLIP_X, PANEL_1_FLIP_Y);
+  Serial.printf("  Panel 2 (Middle): FLIP_X=%d, FLIP_Y=%d\n", PANEL_2_FLIP_X, PANEL_2_FLIP_Y);
+  Serial.printf("  Panel 3 (Bottom): FLIP_X=%d, FLIP_Y=%d\n", PANEL_3_FLIP_X, PANEL_3_FLIP_Y);
+  Serial.printf("  Power Limit:    %d mA @ 5V (USB Safe)\n", MAX_POWER_MA);
+  Serial.printf("  Brightness:     %d / 255\n", BRIGHTNESS);
   Serial.println("==================================================");
 
-  // Initialize FastLED on GPIO 13
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_POWER_MA); // Protect USB power rail
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_POWER_MA);
 
-  // Flash all LEDs green briefly to confirm power & signal
-  fill_solid(leds, NUM_LEDS, CRGB::Green);
+  // Brief flash to confirm all 768 LEDs respond
+  fill_solid(leds, NUM_LEDS, CRGB(0, 25, 0));
   FastLED.show();
-  delay(300);
+  delay(250);
   FastLED.clear();
   FastLED.show();
   delay(200);
 
-  Serial.println("Initialization complete. Starting test cycles...\n");
+  Serial.println("Starting 3-panel test cycle...\n");
 }
 
 void loop() {
-  // Run test sequence
-  testLinearCrawler();
-  testFourCorners();
-  testColumnSweep();
-  testRowSweep();
-  testBouncingPixel();
-  testRainbowWave();
+  // 1. Orientation map with "1", "2", "3", and directional arrows (5s hold)
+  testOrientationMap();
 
-  // Clear and pause before repeating
+  // 2. Downward row sweep (Top to Bottom across both seams)
+  testRowSweep();
+
+  // 3. Left-to-right column sweep (24px bar across all 3 panels)
+  testColumnSweep();
+
+  // 4. Bouncing pixel across all 3 panels
+  testBouncingPixel();
+
   FastLED.clear();
   FastLED.show();
-  Serial.println("\nAll tests completed. Repeating cycle in 1 second...\n");
+  Serial.println("\nCycle complete. Repeating in 1 second...\n");
   delay(1000);
 }
