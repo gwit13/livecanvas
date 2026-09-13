@@ -4,7 +4,7 @@
 // =========================================================================
 // Hardware Configuration
 // =========================================================================
-#define LED_PIN          13         // ESP32 GPIO pin connected to DIN of first panel
+#define LED_PIN          12         // ESP32 GPIO pin connected to DIN of first panel
 #define LED_TYPE         WS2812B    // LED chipset
 #define COLOR_ORDER      GRB        // Color order
 

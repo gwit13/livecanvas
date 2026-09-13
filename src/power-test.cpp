@@ -1,8 +1,8 @@
 #include <Arduino.h>
 #include <FastLED.h>
 
-// ESP-WROOM-32 DevKit pin labeled D13 / GPIO 13.
-#define LED_PIN 13
+// ESP-WROOM-32 DevKit pin labeled D12 / GPIO 12.
+#define LED_PIN 12
 #define NUM_LEDS 3
 #define LED_TYPE WS2812B
 #define COLOR_ORDER GRB
@@ -23,7 +23,7 @@ void setup() {
   delay(200);
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.clear(true);
-  Serial.println("power-test: 256 WS2812B on GPIO 13");
+  Serial.println("power-test: 256 WS2812B on GPIO 12");
 }
 
 void loop() {

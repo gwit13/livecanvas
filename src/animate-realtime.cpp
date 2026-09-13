@@ -12,7 +12,7 @@
 // =========================================================================
 // Hardware Configuration (3x 8x32 daisy-chained panels -> 32x24 array)
 // =========================================================================
-#define LED_PIN          13
+#define LED_PIN          12
 #define LED_TYPE         WS2812B
 #define COLOR_ORDER      GRB
 
