@@ -3,8 +3,10 @@
 #include <WiFi.h>
 #include <time.h>
 #include <math.h>
+#include "esp_sntp.h"
 #include "noaa_solar.h"
 #include "secrets.h"
+#include "sky_time.h"
 
 
 // =========================================================================
@@ -47,6 +49,13 @@ CRGB leds[NUM_LEDS];
 // then set to 1.0f for your wall art!
 #define TIME_MULTIPLIER  720.0f
 
+// Re-query NTP on this real-time interval, then slew the 1x clock
+// toward the result (never step). 0.001 = 1 ms of correction per
+// real second, enough for typical ESP32 drift without a visible jump.
+#define NTP_RESYNC_MS    (24UL * 60UL * 60UL * 1000UL)
+#define NTP_SLEW_RATE    0.001f
+#define NTP_WAIT_MS      15000u
+
 // =========================================================================
 // Painting Dimensions & Masking
 // =========================================================================
@@ -66,17 +75,21 @@ CRGB leds[NUM_LEDS];
 #define MOON_RADIUS      (SUN_RADIUS * 0.8f)
 #define BODY_AA          0.25f
 
-#define MASK_FOREGROUND_CLOUDS  true
-#define MASK_BACKGROUND_CLOUDS  true
-#define MASK_HORIZON            true
+#define MASK_FOREGROUND_CLOUDS  true   // near-clouds: dim + diffuse the body
+#define MASK_BACKGROUND_CLOUDS  true   // far-clouds: dim + diffuse the body
+#define MASK_HORIZON            true   // land fully hides the body
+#define CLOUD_DIM               0.35f  // brightness through clouds (1 = unchanged)
+#define CLOUD_DIFFUSE           1.0f   // radius/falloff scale through clouds
+#define SUN_HORIZON_WARM        0.70f  // 0 = no shift, 1 = full sunset color at horizon
 
 #define STAR_COUNT       6
 
 static const CRGB SUN_COLOR(255, 214, 64);
+static const CRGB SUN_HORIZON_COLOR(255, 72, 12);
 static const CRGB MOON_COLOR(190, 210, 255);
 static const CRGB STAR_COLOR(220, 225, 255);
 
-// Bitmasks from categorized-human.csv
+// Bitmasks from assets/categorized-human-more-clouds.csv
 static const uint64_t FG_CLOUD_MASK[PAINTING_HEIGHT] = {
   0x00031ffe00ULL, 0x001f07fc00ULL, 0x00000001c0ULL, 0x0000001fffULL,
   0x00000000ffULL, 0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL,
@@ -92,7 +105,7 @@ static const uint64_t BG_CLOUD_MASK[PAINTING_HEIGHT] = {
   0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL,
   0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL,
   0x0000000000ULL, 0x0000180000ULL, 0x00087e0000ULL, 0x003ffe8000ULL,
-  0x001c7e0000ULL, 0x0000661bf0ULL, 0x0000000000ULL, 0x0000000000ULL,
+  0x007ffe0000ULL, 0x07ffff1bf0ULL, 0x0fffff0000ULL, 0x0ffffc0000ULL,
   0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL,
   0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL, 0x0000000000ULL,
 };
@@ -154,11 +167,19 @@ static bool maskBit(const uint64_t *mask, int x, int y) {
   return (mask[y] >> x) & 1ULL;
 }
 
+static bool behindHorizon(int x, int y) {
+  return MASK_HORIZON && maskBit(HORIZON_MASK, x, y);
+}
+
+static bool behindCloud(int x, int y) {
+  if (MASK_FOREGROUND_CLOUDS && maskBit(FG_CLOUD_MASK, x, y)) return true;
+  if (MASK_BACKGROUND_CLOUDS && maskBit(BG_CLOUD_MASK, x, y)) return true;
+  return false;
+}
+
 static bool bodyVisible(int x, int y) {
   if (x < 0 || x >= PAINTING_WIDTH || y < 0 || y >= PAINTING_HEIGHT) return false;
-  if (MASK_FOREGROUND_CLOUDS && maskBit(FG_CLOUD_MASK, x, y)) return false;
-  if (MASK_BACKGROUND_CLOUDS && maskBit(BG_CLOUD_MASK, x, y)) return false;
-  if (MASK_HORIZON && maskBit(HORIZON_MASK, x, y)) return false;
+  if (behindHorizon(x, y) || behindCloud(x, y)) return false;
   return true;
 }
 
@@ -170,22 +191,37 @@ static void skyPosition(float t, float *row, float *col) {
   *row = SUN_CENTER_ROW - SUN_ARC_RADIUS * sinf(theta);
 }
 
-static void renderBody(float row, float col, float radius, CRGB color) {
-  FastLED.clear();
+static CRGB sunColorAtRow(float row) {
+  float height = 1.0f;
+  if (SUN_ARC_RADIUS > 0.0f) {
+    height = (SUN_CENTER_ROW - row) / SUN_ARC_RADIUS;
+    if (height < 0.0f) height = 0.0f;
+    if (height > 1.0f) height = 1.0f;
+  }
+  const float warm = (1.0f - height) * SUN_HORIZON_WARM;
+  return SUN_COLOR.lerp8(SUN_HORIZON_COLOR, (uint8_t)(warm * 255.0f + 0.5f));
+}
 
-  const int r0 = (int)floorf(row - radius - 1.0f);
-  const int r1 = (int)ceilf(row + radius + 1.0f);
-  const int c0 = (int)floorf(col - radius - 1.0f);
-  const int c1 = (int)ceilf(col + radius + 1.0f);
+static void renderBody(float row, float col, float radius, CRGB color) {
+  const float reach = radius * CLOUD_DIFFUSE;
+  const int r0 = (int)floorf(row - reach - 1.0f);
+  const int r1 = (int)ceilf(row + reach + 1.0f);
+  const int c0 = (int)floorf(col - reach - 1.0f);
+  const int c1 = (int)ceilf(col + reach + 1.0f);
 
   for (int y = r0; y <= r1; ++y) {
     for (int x = c0; x <= c1; ++x) {
-      if (!bodyVisible(x, y)) continue;
+      if (x < 0 || x >= PAINTING_WIDTH || y < 0 || y >= PAINTING_HEIGHT) continue;
+      if (behindHorizon(x, y)) continue;
 
+      const bool cloud = behindCloud(x, y);
+      const float r = cloud ? (radius * CLOUD_DIFFUSE) : radius;
+      const float aa = cloud ? (BODY_AA * CLOUD_DIFFUSE) : BODY_AA;
       const float dist = hypotf((float)x - col, (float)y - row);
-      float alpha = (radius - dist) / BODY_AA;
+      float alpha = (r - dist) / aa;
       if (alpha <= 0.0f) continue;
       if (alpha > 1.0f) alpha = 1.0f;
+      if (cloud) alpha *= CLOUD_DIM;
 
       const int px = x - PAINTING_ORIGIN_X;
       const int py = y - PAINTING_ORIGIN_Y;
@@ -213,14 +249,100 @@ static void renderStars() {
 // =========================================================================
 // NOAA Astronomical Solar Calculator & Real-Time Engine
 // =========================================================================
-time_t baseEpoch = 0;
-uint32_t baseMillis = 0;
+// 1x UTC wall clock in milliseconds. NTP offsets are queued in
+// pendingSlewMs and absorbed at NTP_SLEW_RATE so animation never steps.
+static int64_t wallMs = 0;
+static int64_t wallOriginMs = 0;
+static int64_t pendingSlewMs = 0;
+static uint32_t lastWallMillis = 0;
+static uint32_t ntpLastDoneMs = 0;
+static uint32_t ntpWaitStartMs = 0;
+static bool ntpWaiting = false;
+static bool wallRunning = false;
 
-// Returns the current simulated or real epoch time in UTC seconds
+static int64_t tickWall() {
+  const uint32_t nowMs = millis();
+  if (!wallRunning) {
+    return wallMs;
+  }
+  const uint32_t dt = nowMs - lastWallMillis;
+  lastWallMillis = nowMs;
+  int64_t absorb = 0;
+  if (pendingSlewMs != 0 && dt > 0) {
+    int64_t maxAbs = (int64_t)((double)dt * (double)NTP_SLEW_RATE);
+    if (maxAbs < 1) {
+      maxAbs = 1;
+    }
+    absorb = pendingSlewMs;
+    if (absorb > maxAbs) absorb = maxAbs;
+    if (absorb < -maxAbs) absorb = -maxAbs;
+    pendingSlewMs -= absorb;
+  }
+  wallMs += (int64_t)dt + absorb;
+  return wallMs;
+}
+
+static void armWallClock(time_t utcEpoch) {
+  wallMs = (int64_t)utcEpoch * 1000;
+  wallOriginMs = wallMs;
+  lastWallMillis = millis();
+  pendingSlewMs = 0;
+  wallRunning = true;
+  ntpLastDoneMs = millis();
+  ntpWaiting = false;
+}
+
+// Simulated (or 1x) epoch. TIME_MULTIPLIER is applied to slewed 1x wall
+// elapsed since boot, so a later NTP correction eases in instead of jumping.
 time_t getCurrentEpoch() {
-  if (baseEpoch == 0) return 0;
-  uint32_t elapsedMs = millis() - baseMillis;
-  return baseEpoch + (time_t)((elapsedMs * TIME_MULTIPLIER) / 1000.0f);
+  const int64_t wall = tickWall();
+  const int64_t elapsed = wall - wallOriginMs;
+  return (time_t)(wallOriginMs / 1000 + (elapsed * (double)TIME_MULTIPLIER) / 1000.0);
+}
+
+static void queueNtpSlew(time_t ntpEpoch) {
+  if (ntpEpoch < 100000000 || !wallRunning) {
+    return;
+  }
+  const int64_t ntpMs = (int64_t)ntpEpoch * 1000;
+  const int64_t wall = tickWall();
+  const int64_t delta = ntpMs - wall;
+  pendingSlewMs += delta;
+  Serial.printf("NTP: offset %+lld ms, slewing %+lld ms remaining\n",
+                (long long)delta, (long long)pendingSlewMs);
+}
+
+static void pollNtp() {
+  if (!wallRunning || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  const uint32_t nowMs = millis();
+  if (!ntpWaiting) {
+    if (nowMs - ntpLastDoneMs < NTP_RESYNC_MS) {
+      return;
+    }
+    sntp_stop();
+    sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+    sntp_init();
+    ntpWaiting = true;
+    ntpWaitStartMs = nowMs;
+    Serial.println("NTP: daily resync started");
+    return;
+  }
+
+  const bool done = sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED;
+  const bool timeout = (nowMs - ntpWaitStartMs) > NTP_WAIT_MS;
+  if (!done && !timeout) {
+    return;
+  }
+  if (done) {
+    queueNtpSlew(time(nullptr));
+  } else {
+    Serial.println("NTP: daily resync timed out");
+  }
+  sntp_stop();
+  ntpWaiting = false;
+  ntpLastDoneMs = nowMs;
 }
 
 // Helper: computes UTC epoch of midnight (00:00:00) for a given UTC day offset
@@ -258,6 +380,16 @@ void getSolarTimes(time_t epoch, int dayOffset, time_t *sunriseEpoch, time_t *su
   *sunsetEpoch  = midnight + (time_t)(setMin * 60.0 + 0.5);
 }
 
+static SkyTime getSkyTime() {
+  SkyTime t;
+  t.now = getCurrentEpoch();
+  getSolarTimes(t.now, 0, &t.sunrise, &t.sunset);
+  time_t dummy;
+  getSolarTimes(t.now, 1, &t.sunrise_next, &dummy);
+  getSolarTimes(t.now, -1, &dummy, &t.sunset_prev);
+  return t;
+}
+
 
 // =========================================================================
 // Setup: Wi-Fi, NTP & System Init
@@ -272,6 +404,8 @@ void setup() {
   Serial.printf("  Location:      Lat %.4f, Lon %.4f\n", LOCATION_LATITUDE, LOCATION_LONGITUDE);
   Serial.printf("  Speed:         %.1fx (%s)\n",
                 TIME_MULTIPLIER, (TIME_MULTIPLIER == 1.0f) ? "Real-Time 1x" : "Simulation Preview");
+  Serial.printf("  Clouds:        dim=%.2f diffuse=%.2f  sun_warm=%.2f\n",
+                CLOUD_DIM, CLOUD_DIFFUSE, SUN_HORIZON_WARM);
   Serial.println("==================================================");
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
@@ -311,8 +445,8 @@ void setup() {
   }
 
   if (now >= 100000000) {
-    baseEpoch = now;
-    baseMillis = millis();
+    armWallClock(now);
+    sntp_stop();
 
     struct tm tm_utc;
     gmtime_r(&now, &tm_utc);
@@ -321,7 +455,7 @@ void setup() {
                   tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
 
     time_t sRise, sSet;
-    getSolarTimes(baseEpoch, 0, &sRise, &sSet);
+    getSolarTimes(now, 0, &sRise, &sSet);
     struct tm rTm, sTm;
     gmtime_r(&sRise, &rTm);
     gmtime_r(&sSet, &sTm);
@@ -330,8 +464,7 @@ void setup() {
     Serial.printf("  Daylight Duration:   %.2f hours\n", (float)(sSet - sRise) / 3600.0f);
   } else {
     Serial.println("\n[WARNING] NTP sync timed out. Falling back to default baseline time.");
-    baseEpoch = 1726246800; // Fallback Sept 13, 2026 ~17:00 UTC
-    baseMillis = millis();
+    armWallClock(1726246800); // Fallback Sept 13, 2026 ~17:00 UTC
   }
 
   Serial.println("Starting real-time animation loop...\n");
@@ -341,67 +474,35 @@ void setup() {
 // Main Loop: Speed-Modulated Astronomical Tracker
 // =========================================================================
 void loop() {
-  time_t now = getCurrentEpoch();
+  pollNtp();
+  const SkyTime sky = getSkyTime();
+  const SkyFrame frame = mapSky(sky);
 
-  time_t sunriseToday, sunsetToday;
-  getSolarTimes(now, 0, &sunriseToday, &sunsetToday);
-
-  bool isDay = (now >= sunriseToday && now < sunsetToday);
+  FastLED.clear();
   float t = 0.0f;
-
-  if (isDay) {
-    // ---------------------------------------------------------------------
-    // DAYTIME: Sun traverses the sky from sunrise to sunset
-    // Speed is automatically modulated by the exact day length!
-    // ---------------------------------------------------------------------
-    time_t dayDuration = sunsetToday - sunriseToday;
-    t = (float)(now - sunriseToday) / (float)dayDuration;
-
+  if (frame.sun.visible) {
+    t = frame.sun.t;
     float row, col;
     skyPosition(t, &row, &col);
-    renderBody(row, col, SUN_RADIUS, SUN_COLOR);
-
-  } else {
-    // ---------------------------------------------------------------------
-    // NIGHTTIME: Moon traverses the sky + stars appear
-    // Speed is automatically modulated by the exact night length!
-    // ---------------------------------------------------------------------
-    time_t nightStart, nightEnd;
-
-    if (now >= sunsetToday) {
-      // Evening: from today's sunset to tomorrow's sunrise
-      nightStart = sunsetToday;
-      time_t sunriseTomorrow, dummy;
-      getSolarTimes(now, 1, &sunriseTomorrow, &dummy);
-      nightEnd = sunriseTomorrow;
-    } else {
-      // Morning before dawn: from yesterday's sunset to today's sunrise
-      time_t dummy, sunsetYesterday;
-      getSolarTimes(now, -1, &dummy, &sunsetYesterday);
-      nightStart = sunsetYesterday;
-      nightEnd = sunriseToday;
-    }
-
-    time_t nightDuration = nightEnd - nightStart;
-    t = (float)(now - nightStart) / (float)nightDuration;
-
+    renderBody(row, col, SUN_RADIUS, sunColorAtRow(row));
+  }
+  if (frame.moon.visible) {
+    t = frame.moon.t;
     float row, col;
     skyPosition(t, &row, &col);
     renderBody(row, col, MOON_RADIUS, MOON_COLOR);
     renderStars();
   }
-
   FastLED.show();
 
-  // Print diagnostics every ~2 seconds in simulation mode, or ~60s in 1x mode
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 2000) {
     lastLog = millis();
     struct tm curTm;
-    gmtime_r(&now, &curTm);
+    gmtime_r(&sky.now, &curTm);
     Serial.printf("[%02d:%02d:%02d UTC] %s | Progress t=%.3f\n",
                   curTm.tm_hour, curTm.tm_min, curTm.tm_sec,
-                  isDay ? "DAY (Sun)" : "NIGHT (Moon+Stars)", t);
+                  frame.sun.visible ? "DAY (Sun)" : "NIGHT (Moon+Stars)", t);
   }
 
   delay(20);
