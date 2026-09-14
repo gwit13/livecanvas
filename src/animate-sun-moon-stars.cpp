@@ -5,7 +5,7 @@
 // =========================================================================
 // Hardware — same 3x 8x32 daisy-chain as panel_test.cpp
 // =========================================================================
-#define LED_PIN          12
+#define LED_PIN          27
 #define LED_TYPE         WS2812B
 #define COLOR_ORDER      GRB
 

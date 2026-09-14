@@ -12,7 +12,7 @@
 // =========================================================================
 // Hardware Configuration (3x 8x32 daisy-chained panels -> 32x24 array)
 // =========================================================================
-#define LED_PIN          12
+#define LED_PIN          27
 #define LED_TYPE         WS2812B
 #define COLOR_ORDER      GRB
 
@@ -45,9 +45,9 @@ CRGB leds[NUM_LEDS];
 //           Takes 24 real hours for a full day/night cycle.
 //   60.0f = 1 minute per real second (full 24h day takes 24 minutes).
 //  720.0f = Fast preview: full 24h day takes 2 minutes!
-// Start with 720.0f to test the full sunrise->sunset->moonrise cycle,
-// then set to 1.0f for your wall art!
-#define TIME_MULTIPLIER  720.0f
+#ifndef TIME_MULTIPLIER
+#define TIME_MULTIPLIER  1.0f
+#endif
 
 // Re-query NTP on this real-time interval, then slew the 1x clock
 // toward the result (never step). 0.001 = 1 ms of correction per
@@ -345,39 +345,34 @@ static void pollNtp() {
   ntpLastDoneMs = nowMs;
 }
 
-// Helper: computes UTC epoch of midnight (00:00:00) for a given UTC day offset
-time_t getMidnightEpoch(time_t epoch, int dayOffset) {
-  time_t target = epoch + (dayOffset * 86400);
-  struct tm tm_info;
-  gmtime_r(&target, &tm_info);
-  tm_info.tm_hour = 0;
-  tm_info.tm_min = 0;
-  tm_info.tm_sec = 0;
-  // Convert UTC tm back to time_t using standard UTC epoch formula:
-  int y = tm_info.tm_year + 1900;
-  int m = tm_info.tm_mon + 1;
-  int d = tm_info.tm_mday;
-  if (m <= 2) { y--; m += 12; }
-  long long days = (365LL * y) + (y / 4) - (y / 100) + (y / 400) + ((153 * (m - 3) + 2) / 5) + d - 719469;
-  return (time_t)(days * 86400LL);
+// Days since Unix epoch (1970-01-01) for year, month, day (Gregorian calendar)
+static inline long long daysSinceEpoch(int y, int m, int d) {
+  if (m <= 2) {
+    y--;
+    m += 12;
+  }
+  return (365LL * y) + (y / 4) - (y / 100) + (y / 400) + ((153 * (m - 3) + 2) / 5) + d - 719469LL;
 }
 
-// Gets sunrise and sunset epoch for a given date offset from current epoch
+// Gets sunrise and sunset UTC epoch for a given date offset from the local day of epoch
 void getSolarTimes(time_t epoch, int dayOffset, time_t *sunriseEpoch, time_t *sunsetEpoch) {
-  time_t midnight = getMidnightEpoch(epoch, dayOffset);
-  time_t target = midnight + 43200; // midday for date extraction
-  struct tm tm_info;
-  gmtime_r(&target, &tm_info);
+  // Convert UTC epoch to local calendar day by taking into account TIMEZONE_OFFSET_SEC.
+  // This guarantees that "today" corresponds to the local calendar day (sunrise and sunset
+  // both fall on the same local date) avoiding premature jumps when UTC rolls over at ~7 PM CDT.
+  time_t targetLocal = (epoch + TIMEZONE_OFFSET_SEC) + ((time_t)dayOffset * 86400LL);
+  struct tm tm_local;
+  gmtime_r(&targetLocal, &tm_local);
 
-  int y = tm_info.tm_year + 1900;
-  int m = tm_info.tm_mon + 1;
-  int d = tm_info.tm_mday;
+  int y = tm_local.tm_year + 1900;
+  int m = tm_local.tm_mon + 1;
+  int d = tm_local.tm_mday;
 
   double riseMin = 0, setMin = 0;
   NOAA::calculateSunriseSunsetUTC(y, m, d, LOCATION_LATITUDE, LOCATION_LONGITUDE, riseMin, setMin);
 
-  *sunriseEpoch = midnight + (time_t)(riseMin * 60.0 + 0.5);
-  *sunsetEpoch  = midnight + (time_t)(setMin * 60.0 + 0.5);
+  time_t utcMidnight = (time_t)(daysSinceEpoch(y, m, d) * 86400LL);
+  *sunriseEpoch = utcMidnight + (time_t)(riseMin * 60.0 + 0.5);
+  *sunsetEpoch  = utcMidnight + (time_t)(setMin * 60.0 + 0.5);
 }
 
 static SkyTime getSkyTime() {
@@ -402,6 +397,7 @@ void setup() {
   Serial.println("  LiveCanvas: Real-Time NOAA Astronomical Sync");
   Serial.println("==================================================");
   Serial.printf("  Location:      Lat %.4f, Lon %.4f\n", LOCATION_LATITUDE, LOCATION_LONGITUDE);
+  Serial.printf("  Data Pin:      GPIO %d\n", LED_PIN);
   Serial.printf("  Speed:         %.1fx (%s)\n",
                 TIME_MULTIPLIER, (TIME_MULTIPLIER == 1.0f) ? "Real-Time 1x" : "Simulation Preview");
   Serial.printf("  Clouds:        dim=%.2f diffuse=%.2f  sun_warm=%.2f\n",
@@ -416,6 +412,8 @@ void setup() {
   // 1. Connect to Wi-Fi
   Serial.printf("Connecting to Wi-Fi SSID '%s'...", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t wifiStart = millis();
@@ -448,20 +446,23 @@ void setup() {
     armWallClock(now);
     sntp_stop();
 
-    struct tm tm_utc;
-    gmtime_r(&now, &tm_utc);
-    Serial.printf("\nNTP Synced! Current UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-                  tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
-                  tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+    time_t localNow = now + TIMEZONE_OFFSET_SEC;
+    struct tm locNowTm;
+    gmtime_r(&localNow, &locNowTm);
+    Serial.printf("\nNTP Synced! Local Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  locNowTm.tm_year + 1900, locNowTm.tm_mon + 1, locNowTm.tm_mday,
+                  locNowTm.tm_hour, locNowTm.tm_min, locNowTm.tm_sec);
 
     time_t sRise, sSet;
     getSolarTimes(now, 0, &sRise, &sSet);
+    time_t rLoc = sRise + TIMEZONE_OFFSET_SEC;
+    time_t sLoc = sSet + TIMEZONE_OFFSET_SEC;
     struct tm rTm, sTm;
-    gmtime_r(&sRise, &rTm);
-    gmtime_r(&sSet, &sTm);
-    Serial.printf("  Today Sunrise (UTC): %02d:%02d:%02d\n", rTm.tm_hour, rTm.tm_min, rTm.tm_sec);
-    Serial.printf("  Today Sunset  (UTC): %02d:%02d:%02d\n", sTm.tm_hour, sTm.tm_min, sTm.tm_sec);
-    Serial.printf("  Daylight Duration:   %.2f hours\n", (float)(sSet - sRise) / 3600.0f);
+    gmtime_r(&rLoc, &rTm);
+    gmtime_r(&sLoc, &sTm);
+    Serial.printf("  Today Sunrise (Local): %02d:%02d:%02d\n", rTm.tm_hour, rTm.tm_min, rTm.tm_sec);
+    Serial.printf("  Today Sunset  (Local): %02d:%02d:%02d\n", sTm.tm_hour, sTm.tm_min, sTm.tm_sec);
+    Serial.printf("  Daylight Duration:     %.2f hours\n", (float)(sSet - sRise) / 3600.0f);
   } else {
     Serial.println("\n[WARNING] NTP sync timed out. Falling back to default baseline time.");
     armWallClock(1726246800); // Fallback Sept 13, 2026 ~17:00 UTC
@@ -498,10 +499,11 @@ void loop() {
   static uint32_t lastLog = 0;
   if (millis() - lastLog > 2000) {
     lastLog = millis();
-    struct tm curTm;
-    gmtime_r(&sky.now, &curTm);
-    Serial.printf("[%02d:%02d:%02d UTC] %s | Progress t=%.3f\n",
-                  curTm.tm_hour, curTm.tm_min, curTm.tm_sec,
+    time_t localNow = sky.now + TIMEZONE_OFFSET_SEC;
+    struct tm locTm;
+    gmtime_r(&localNow, &locTm);
+    Serial.printf("[%02d:%02d:%02d Local] %s | Progress t=%.3f\n",
+                  locTm.tm_hour, locTm.tm_min, locTm.tm_sec,
                   frame.sun.visible ? "DAY (Sun)" : "NIGHT (Moon+Stars)", t);
   }
 

@@ -2,7 +2,7 @@
 #include <FastLED.h>
 
 // ESP-WROOM-32 DevKit pin labeled D12 / GPIO 12.
-#define LED_PIN 12
+#define LED_PIN 27
 #define NUM_LEDS 3
 #define LED_TYPE WS2812B
 #define COLOR_ORDER GRB
