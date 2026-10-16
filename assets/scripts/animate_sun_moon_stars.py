@@ -54,8 +54,10 @@ MOON_DURATION_S = 10.0
 FPS = 15
 
 SUN_RGB = np.array([255.0, 214.0, 64.0])
-MOON_RGB = np.array([190.0, 210.0, 255.0])
-STAR_RGB = np.array([220.0, 225.0, 255.0])
+# Linear LED PWM, matching the firmware. CIE L* halved from (190, 210, 255).
+MOON_RGB = np.array([36.0, 40.0, 48.0])
+# Linear LED PWM, matching the firmware. CIE L* halved from (220, 225, 255).
+STAR_RGB = np.array([41.0, 42.0, 48.0])
 
 CRGB_RE = re.compile(r"CRGB\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
 WIDTH_RE = re.compile(r"#define\s+PAINTING_WIDTH\s+(\d+)")

@@ -60,7 +60,8 @@ CRGB leds[NUM_LEDS];
 #define MASK_HORIZON            true   // foreground + background land form the horizon
 
 static const CRGB SUN_COLOR(255, 214, 64);
-static const CRGB MOON_COLOR(190, 210, 255);
+// Linear WS2812B PWM. CIE L* halved from (190, 210, 255): ~92.6 -> ~46.4.
+static const CRGB MOON_COLOR(36, 40, 48);
 
 // Bit x of row y is 1 for that occluder. Packed from categorized-human.csv.
 static const uint64_t FG_CLOUD_MASK[PAINTING_HEIGHT] = {
